@@ -218,6 +218,16 @@ PANEL_HTML = """
       $("status").textContent = m.message;
     }
   });
+  // Report the panel width once the user stops resizing, so it can be restored next time.
+  let widthTimer = null, lastWidth = 0;
+  new ResizeObserver(() => {
+    clearTimeout(widthTimer);
+    widthTimer = setTimeout(() => {
+      const w = Math.round(document.documentElement.clientWidth);
+      if (w >= 100 && lastWidth && w !== lastWidth) send("width", {value: w});
+      lastWidth = w;
+    }, 600);
+  }).observe(document.documentElement);
   updateExport();
   send("refresh");
 </script>
@@ -271,7 +281,8 @@ _config_owner = None
 
 def _default_settings():
     return {"blender_path": DEFAULT_BLENDER.get(platform.system(), "blender"),
-            "auto_open": True, "compact_mode": True}
+            "auto_open": True, "compact_mode": True,
+            "panel_width": 320, "compact_panel_width": 150}
 
 
 def _load_settings(owner):
@@ -469,7 +480,8 @@ class EditInBlenderPanel(orca.script.ScriptPluginCapabilityBase):
         self._panel = orca.host.ui.create_dock_panel(
             html=PANEL_HTML,
             title="Edit in Blender",
-            width=150 if _settings.get("compact_mode") else 320,
+            width=int(_settings.get(
+                "compact_panel_width" if _settings.get("compact_mode") else "panel_width") or 320),
             height=300 if _settings.get("compact_mode") else 520,
             on_message=self.on_message,
             on_close=self.on_close,
@@ -530,6 +542,11 @@ class EditInBlenderPanel(orca.script.ScriptPluginCapabilityBase):
                 ok = _update_settings(blender_path=data.get("path", "").strip())
                 self._status("Blender path saved." if ok else
                              "Applied for this session, but saving to the plugin config failed.")
+            elif kind == "width":
+                w = int(data.get("value", 0))
+                if 100 <= w <= 2000:
+                    key = "compact_panel_width" if _settings.get("compact_mode") else "panel_width"
+                    _update_settings(**{key: w})
             elif kind == "set_auto_open":
                 ok = _update_settings(auto_open=bool(data.get("value")))
                 if not ok:
