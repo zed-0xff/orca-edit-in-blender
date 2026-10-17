@@ -70,10 +70,129 @@ DEFAULT_BLENDER = {
     "Linux": "blender",
 }
 
+PANEL_HTML = """
+<style>
+  body { font-family: var(--orca-font, sans-serif); color: var(--orca-fg); background: var(--orca-bg);
+         margin: 0; padding: 10px; font-size: 13px; }
+  button { background: var(--orca-accent); color: #fff; border: 0; border-radius: 4px;
+           padding: 6px 10px; margin: 2px 2px 2px 0; cursor: pointer; }
+  button:disabled { opacity: 0.4; cursor: default; }
+  button.secondary { background: transparent; color: var(--orca-fg); border: 1px solid var(--orca-border); }
+  h4 { margin: 12px 0 4px; }
+  label { display: block; padding: 2px 0; }
+  .muted { color: var(--orca-muted); font-size: 12px; word-break: break-all; }
+  input[type=text] { width: 100%; box-sizing: border-box; background: transparent; color: var(--orca-fg);
+                     border: 1px solid var(--orca-border); border-radius: 4px; padding: 4px; }
+  #status { margin-top: 10px; min-height: 2em; }
+</style>
+<h4>Objects on plate</h4>
+<div id="objects" class="muted">Loading...</div>
+<button class="secondary" id="refresh">Refresh</button>
+<button class="secondary" id="all">Select all</button>
+<h4>Send</h4>
+<button id="export">Edit selected</button>
+<h4>Receive</h4>
+<button id="load" disabled>Load edits</button><br>
+<button class="secondary" id="reveal">Reveal edits folder</button>
+<button class="secondary" id="copy">Copy path</button>
+<div class="muted" id="outdir"></div>
+<h4>Blender path</h4>
+<input type="text" id="blender">
+<button class="secondary" id="save">Save path</button>
+<label><input type="checkbox" id="auto"> Open this panel at startup</label>
+<div id="status" class="muted"></div>
+<script>
+  const $ = id => document.getElementById(id);
+  const send = (type, extra) => orca.postMessage(Object.assign({type}, extra || {}));
+  let outDir = "";
+  const updateExport = () => {
+    $("export").disabled = !document.querySelector("#objects input:checked");
+  };
+  $("objects").addEventListener("change", updateExport);
+  $("refresh").onclick = () => send("refresh");
+  $("all").onclick = () => {
+    document.querySelectorAll("#objects input").forEach(c => c.checked = true);
+    updateExport();
+  };
+  $("export").onclick = () => send("export", {indices:
+      [...document.querySelectorAll("#objects input:checked")].map(c => Number(c.value))});
+  $("load").onclick = () => send("load");
+  $("reveal").onclick = () => send("reveal");
+  $("auto").onchange = () => send("set_auto_open", {value: $("auto").checked});
+  $("save").onclick = () => send("set_blender", {path: $("blender").value});
+  $("copy").onclick = () => {
+    navigator.clipboard.writeText(outDir).then(
+      () => $("status").textContent = "Path copied.",
+      () => $("status").textContent = "Copy failed; select the path above manually.");
+  };
+  orca.onMessage(m => {
+    if (m.type === "state") {
+      outDir = m.out_dir;
+      $("outdir").textContent = m.out_dir;
+      $("blender").value = m.blender;
+      $("auto").checked = m.auto_open;
+      $("load").disabled = !m.has_edits;
+      const box = $("objects");
+      box.textContent = "";
+      if (!m.objects.length) box.textContent = "The plate is empty.";
+      m.objects.forEach(o => {
+        const l = document.createElement("label");
+        const c = document.createElement("input");
+        c.type = "checkbox"; c.value = o.index; c.checked = true;
+        l.append(c, " " + o.name + " (" + o.triangles + " tris)");
+        box.append(l);
+      });
+      updateExport();
+    } else if (m.type === "edits") {
+      $("load").disabled = !m.has;
+    } else if (m.type === "status") {
+      $("status").textContent = m.message;
+    }
+  });
+  updateExport();
+  send("refresh");
+  setInterval(() => send("poll_edits"), 2000);
+</script>
+"""
 
-def _work_dirs():
-    root = Path(orca.host.plugin.storage()) / "edit_in_blender"
-    return root / "in", root / "out", root / "session.blend", root / "blender_startup.py"
+
+_storage = None
+
+
+def _init_storage():
+    """storage() only works inside a capability callback (execute/on_load), not panel messages."""
+    global _storage
+    _storage = Path(orca.host.plugin.storage()) / "edit_in_blender"
+
+
+def _dirs():
+    root = _storage
+    return root / "in", root / "out", root / "session.blend", root / "blender_startup.py", root / "settings.json"
+
+
+def _read_settings():
+    try:
+        return json.loads(_dirs()[4].read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def _update_settings(**changes):
+    path = _dirs()[4]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({**_read_settings(), **changes}))
+
+
+def _blender_path():
+    return _read_settings().get("blender_path") or DEFAULT_BLENDER.get(platform.system(), "blender")
+
+
+def _has_edits():
+    return any(_dirs()[1].glob("*.stl"))
+
+
+def _auto_open():
+    return _read_settings().get("auto_open", True)
 
 
 def _write_binary_stl(path, vertices, triangles):
@@ -94,101 +213,179 @@ def _safe(name):
     return "".join(c if c.isalnum() or c in "-_ " else "_" for c in name).strip() or "object"
 
 
-def _open_in_orca(paths):
-    """Hand files to the running OrcaSlicer via the OS file-open mechanism."""
+def _object_name(obj, i):
+    return getattr(obj, "name", "") or f"object {i}"
+
+
+def _list_objects():
+    items = []
+    for i, obj in enumerate(orca.host.model().objects()):
+        tris = sum(v.mesh().triangle_count() for v in obj.volumes())
+        items.append({"index": i, "name": _object_name(obj, i), "triangles": tris})
+    return items
+
+
+def _open_path(path, reveal_app=None):
     system = platform.system()
-    for p in paths:
-        if system == "Darwin":
-            subprocess.Popen(["open", "-a", "OrcaSlicer", str(p)])
-        elif system == "Windows":
-            os.startfile(str(p))  # noqa: S606 - uses the .stl file association
-        else:
-            subprocess.Popen(["xdg-open", str(p)])
+    if system == "Darwin":
+        subprocess.Popen(["open", *(["-a", reveal_app] if reveal_app else []), str(path)])
+    elif system == "Windows":
+        os.startfile(str(path))  # noqa: S606 - uses the file association
+    else:
+        subprocess.Popen(["xdg-open", str(path)])
 
 
-class _Configurable:
-    def get_default_config(self):
-        return {"blender_path": DEFAULT_BLENDER.get(platform.system(), "blender")}
+def _export_and_launch(indices=None):
+    """Export objects (all if indices is None) to STL and launch Blender.
 
-    def _blender_path(self):
-        try:
-            cfg = json.loads(self.get_config())
-        except (TypeError, ValueError):
-            cfg = {}
-        return cfg.get("blender_path") or self.get_default_config()["blender_path"]
+    Returns an ExecutionResult.
+    """
+    in_dir, out_dir, session, startup, _ = _dirs()
+    in_dir.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for old in (*in_dir.glob("*.stl"), *out_dir.glob("*.stl")):
+        old.unlink()
 
-
-class EditInBlender(_Configurable, orca.script.ScriptPluginCapabilityBase):
-    def get_name(self):
-        return "Edit in Blender"
-
-    def execute(self):
-        in_dir, out_dir, session, startup = _work_dirs()
-        in_dir.mkdir(parents=True, exist_ok=True)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        for old in (*in_dir.glob("*.stl"), *out_dir.glob("*.stl")):
-            old.unlink()
-
-        exported = 0
-        for i, obj in enumerate(orca.host.model().objects()):
-            verts, tris = [], []
-            offset = 0
-            for vol in obj.volumes():
-                mesh = vol.mesh()
-                if mesh.is_empty():
-                    continue
-                v = mesh.vertices().astype(np.float64)
-                m = vol.matrix()
-                v = v @ m[:3, :3].T + m[:3, 3]
-                verts.append(v)
-                tris.append(mesh.triangles().astype(np.int64) + offset)
-                offset += len(v)
-            if not verts:
+    exported = 0
+    for i, obj in enumerate(orca.host.model().objects()):
+        if indices is not None and i not in indices:
+            continue
+        verts, tris = [], []
+        offset = 0
+        for vol in obj.volumes():
+            mesh = vol.mesh()
+            if mesh.is_empty():
                 continue
-            name = f"{i:02d}_{_safe(getattr(obj, 'name', '') or 'object')}"
-            _write_binary_stl(in_dir / f"{name}.stl", np.vstack(verts), np.vstack(tris))
-            exported += 1
+            v = mesh.vertices().astype(np.float64)
+            m = vol.matrix()
+            v = v @ m[:3, :3].T + m[:3, 3]
+            verts.append(v)
+            tris.append(mesh.triangles().astype(np.int64) + offset)
+            offset += len(v)
+        if not verts:
+            continue
+        name = f"{i:02d}_{_safe(_object_name(obj, i))}"
+        _write_binary_stl(in_dir / f"{name}.stl", np.vstack(verts), np.vstack(tris))
+        exported += 1
 
-        if not exported:
-            return orca.ExecutionResult.skipped("The plate has no objects to export.")
+    if not exported:
+        return orca.ExecutionResult.skipped("No objects to export.")
 
-        startup.write_text(BLENDER_SCRIPT, encoding="utf-8")
-        blender = self._blender_path()
-        try:
-            subprocess.Popen(
-                [blender, "--python", str(startup), "--", str(in_dir), str(out_dir), str(session)]
-            )
-        except OSError as e:
-            return orca.ExecutionResult.failure(
-                orca.PluginResult.RecoverableError,
-                f"Could not launch Blender at '{blender}': {e}. Set blender_path in the plugin config.",
-            )
-        return orca.ExecutionResult.success(
-            f"Exported {exported} object(s) to Blender. Save (Ctrl+S) in Blender, "
-            "then run 'Load Blender Edits'."
+    startup.write_text(BLENDER_SCRIPT, encoding="utf-8")
+    blender = _blender_path()
+    try:
+        subprocess.Popen(
+            [blender, "--python", str(startup), "--", str(in_dir), str(out_dir), str(session)]
         )
+    except OSError as e:
+        return orca.ExecutionResult.failure(
+            orca.PluginResult.RecoverableError,
+            f"Could not launch Blender at '{blender}': {e}. Set the path in the Edit in Blender panel.",
+        )
+    return orca.ExecutionResult.success(
+        f"Exported {exported} object(s) to Blender. Save (Ctrl+S) in Blender, then load the edits."
+    )
 
 
-class LoadBlenderEdits(orca.script.ScriptPluginCapabilityBase):
+def _load_edits():
+    out_dir = _dirs()[1]
+    files = sorted(out_dir.glob("*.stl"))
+    if not files:
+        return orca.ExecutionResult.skipped("No edited meshes found. Save the session in Blender first.")
+    for f in files:
+        _open_path(f, reveal_app="OrcaSlicer")
+    return orca.ExecutionResult.success(
+        f"Opened {len(files)} edited object(s) in OrcaSlicer. Delete the originals if no longer needed."
+    )
+
+
+class EditInBlenderPanel(orca.script.ScriptPluginCapabilityBase):
+    """Docked Edit in Blender panel; opens on load, or via its Run action."""
+
+    def __init__(self):
+        super().__init__()
+        self._panel = None
+
     def get_name(self):
-        return "Load Blender Edits"
+        return "Show Edit in Blender Panel"
+
+    def on_load(self):
+        # Auto-open at startup. If the host isn't ready for UI yet, fall back to
+        # running "Show Edit in Blender Panel" from the Plugins dialog.
+        try:
+            _init_storage()
+            if _auto_open():
+                self._open_panel()
+        except Exception as e:
+            print(f"Edit in Blender: could not auto-open panel from on_load: {e!r}")
 
     def execute(self):
-        _, out_dir, _, _ = _work_dirs()
-        files = sorted(out_dir.glob("*.stl"))
-        if not files:
-            return orca.ExecutionResult.skipped(
-                "No edited meshes found. Save the session in Blender first."
-            )
-        _open_in_orca(files)
-        return orca.ExecutionResult.success(
-            f"Opened {len(files)} edited object(s) in OrcaSlicer. "
-            "Delete the originals from the plate if you no longer need them."
+        if self._panel is not None:
+            return orca.ExecutionResult.skipped("The panel is already open.")
+        self._open_panel()
+        return orca.ExecutionResult.success("Edit in Blender panel opened.")
+
+    def _open_panel(self):
+        _init_storage()
+        if self._panel is not None:
+            return
+        self._panel = orca.host.ui.create_dock_panel(
+            html=PANEL_HTML,
+            title="Edit in Blender",
+            width=320,
+            height=520,
+            on_message=self.on_message,
+            on_close=self.on_close,
+            dock="right",
         )
+
+    def on_close(self, *_):
+        self._panel = None
+
+    def _status(self, message):
+        self._panel.post({"type": "status", "message": message})
+
+    def on_message(self, data):
+        if isinstance(data, str):
+            data = json.loads(data)
+        kind = data.get("type")
+        try:
+            if kind == "refresh":
+                self._panel.post({
+                    "type": "state",
+                    "objects": _list_objects(),
+                    "out_dir": str(_dirs()[1]),
+                    "blender": _blender_path(),
+                    "auto_open": _auto_open(),
+                    "has_edits": _has_edits(),
+                })
+            elif kind == "poll_edits":
+                self._panel.post({"type": "edits", "has": _has_edits()})
+            elif kind == "export":
+                indices = set(data.get("indices") or [])
+                if not indices:
+                    return self._status("Select at least one object.")
+                result = _export_and_launch(indices)
+                self._panel.post({"type": "edits", "has": _has_edits()})
+                self._status(result.message)
+            elif kind == "load":
+                self._status(_load_edits().message)
+            elif kind == "reveal":
+                out_dir = _dirs()[1]
+                out_dir.mkdir(parents=True, exist_ok=True)
+                _open_path(out_dir)
+            elif kind == "set_blender":
+                _update_settings(blender_path=data.get("path", "").strip())
+                self._status("Blender path saved.")
+            elif kind == "set_auto_open":
+                _update_settings(auto_open=bool(data.get("value")))
+                self._status("Panel will open at startup." if data.get("value")
+                             else "Panel will not open at startup. Use 'Show Edit in Blender Panel'.")
+        except Exception as e:  # keep the panel alive; show the error inline
+            self._status(f"Error: {e}")
 
 
 @orca.plugin
 class EditInBlenderPlugin(orca.base):
     def register_capabilities(self):
-        orca.register_capability(EditInBlender)
-        orca.register_capability(LoadBlenderEdits)
+        orca.register_capability(EditInBlenderPanel)
