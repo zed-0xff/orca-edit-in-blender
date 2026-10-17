@@ -5,7 +5,7 @@
 # [tool.orcaslicer.plugin]
 # name = "Edit in Blender"
 # description = "Export plate objects to Blender, edit them, and load the result back into OrcaSlicer."
-# author = "Andrey Zaikin"
+# author = 'Andrey "Zed" Zaikin'
 # version = "0.1.0"
 # ///
 import json
