@@ -84,22 +84,27 @@ PANEL_HTML = """
   input[type=text] { width: 100%; box-sizing: border-box; background: transparent; color: var(--orca-fg);
                      border: 1px solid var(--orca-border); border-radius: 4px; padding: 4px; }
   #status { margin-top: 10px; min-height: 2em; }
+  body.compact .full-only { display: none; }
 </style>
 <h4>Objects on plate</h4>
 <div id="objects" class="muted">Loading...</div>
 <button class="secondary" id="refresh">Refresh</button>
 <button class="secondary" id="all">Select all</button>
-<h4>Send</h4>
-<button id="export">Edit selected</button>
-<h4>Receive</h4>
-<button id="load" disabled>Load edits</button><br>
-<button class="secondary" id="reveal">Reveal edits folder</button>
-<button class="secondary" id="copy">Copy path</button>
-<div class="muted" id="outdir"></div>
-<h4>Blender path</h4>
-<input type="text" id="blender">
-<button class="secondary" id="save">Save path</button>
-<label><input type="checkbox" id="auto"> Open this panel at startup</label>
+<div id="actions">
+  <h4 class="full-only">Send</h4>
+  <button id="export">Edit selected</button>
+  <h4 class="full-only">Receive</h4>
+  <button id="load" disabled>Load edits</button>
+</div>
+<div class="full-only">
+  <button class="secondary" id="reveal">Reveal edits folder</button>
+  <button class="secondary" id="copy">Copy path</button>
+  <div class="muted" id="outdir"></div>
+  <h4>Blender path</h4>
+  <input type="text" id="blender">
+  <button class="secondary" id="save">Save path</button>
+  <label><input type="checkbox" id="auto"> Open this panel at startup</label>
+</div>
 <div id="status" class="muted"></div>
 <script>
   const $ = id => document.getElementById(id);
@@ -127,6 +132,7 @@ PANEL_HTML = """
   };
   orca.onMessage(m => {
     if (m.type === "state") {
+      document.body.classList.toggle("compact", m.compact_mode);
       outDir = m.out_dir;
       $("outdir").textContent = m.out_dir;
       $("blender").value = m.blender;
@@ -170,21 +176,51 @@ def _dirs():
     return root / "in", root / "out", root / "session.blend", root / "blender_startup.py", root / "settings.json"
 
 
-def _read_settings():
+_settings = {}
+_config_owner = None
+
+
+def _default_settings():
+    return {"blender_path": DEFAULT_BLENDER.get(platform.system(), "blender"),
+            "auto_open": True, "compact_mode": False}
+
+
+def _load_settings(owner):
+    """Read the capability's native config. Needs a plugin callback (on_load/execute)."""
+    global _settings, _config_owner
+    _config_owner = owner
     try:
-        return json.loads(_dirs()[4].read_text())
-    except (OSError, ValueError):
-        return {}
+        stored = json.loads(owner.get_config())
+    except (TypeError, ValueError):
+        stored = {}
+    _settings = {**_default_settings(), **stored}
+    if _settings != stored:
+        # Write missing keys back so the config the user sees lists every option.
+        try:
+            owner.save_config(json.dumps(_settings))
+        except Exception:
+            pass
+    legacy = _dirs()[4]  # settings.json from before the native config
+    if legacy.exists():
+        try:
+            _settings.update(json.loads(legacy.read_text()))
+            if owner.save_config(json.dumps(_settings)):
+                legacy.unlink()
+        except (OSError, ValueError):
+            pass
 
 
 def _update_settings(**changes):
-    path = _dirs()[4]
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({**_read_settings(), **changes}))
+    """Apply changes in memory and persist them; returns False if persisting failed."""
+    _settings.update(changes)
+    try:
+        return bool(_config_owner.save_config(json.dumps(_settings)))
+    except Exception:
+        return False
 
 
 def _blender_path():
-    return _read_settings().get("blender_path") or DEFAULT_BLENDER.get(platform.system(), "blender")
+    return _settings.get("blender_path") or _default_settings()["blender_path"]
 
 
 def _has_edits():
@@ -192,7 +228,7 @@ def _has_edits():
 
 
 def _auto_open():
-    return _read_settings().get("auto_open", True)
+    return _settings.get("auto_open", True)
 
 
 def _write_binary_stl(path, vertices, triangles):
@@ -309,11 +345,15 @@ class EditInBlenderPanel(orca.script.ScriptPluginCapabilityBase):
     def get_name(self):
         return "Show Edit in Blender Panel"
 
+    def get_default_config(self):
+        return _default_settings()
+
     def on_load(self):
         # Auto-open at startup. If the host isn't ready for UI yet, fall back to
         # running "Show Edit in Blender Panel" from the Plugins dialog.
         try:
             _init_storage()
+            _load_settings(self)
             if _auto_open():
                 self._open_panel()
         except Exception as e:
@@ -327,13 +367,14 @@ class EditInBlenderPanel(orca.script.ScriptPluginCapabilityBase):
 
     def _open_panel(self):
         _init_storage()
+        _load_settings(self)
         if self._panel is not None:
             return
         self._panel = orca.host.ui.create_dock_panel(
             html=PANEL_HTML,
             title="Edit in Blender",
-            width=320,
-            height=520,
+            width=220 if _settings.get("compact_mode") else 320,
+            height=300 if _settings.get("compact_mode") else 520,
             on_message=self.on_message,
             on_close=self.on_close,
             dock="right",
@@ -351,6 +392,10 @@ class EditInBlenderPanel(orca.script.ScriptPluginCapabilityBase):
         kind = data.get("type")
         try:
             if kind == "refresh":
+                try:  # pick up edits made in the Plugins dialog's config tab
+                    _settings.update(json.loads(self.get_config()))
+                except Exception:
+                    pass
                 self._panel.post({
                     "type": "state",
                     "objects": _list_objects(),
@@ -358,6 +403,7 @@ class EditInBlenderPanel(orca.script.ScriptPluginCapabilityBase):
                     "blender": _blender_path(),
                     "auto_open": _auto_open(),
                     "has_edits": _has_edits(),
+                    "compact_mode": bool(_settings.get("compact_mode")),
                 })
             elif kind == "poll_edits":
                 self._panel.post({"type": "edits", "has": _has_edits()})
@@ -375,12 +421,16 @@ class EditInBlenderPanel(orca.script.ScriptPluginCapabilityBase):
                 out_dir.mkdir(parents=True, exist_ok=True)
                 _open_path(out_dir)
             elif kind == "set_blender":
-                _update_settings(blender_path=data.get("path", "").strip())
-                self._status("Blender path saved.")
+                ok = _update_settings(blender_path=data.get("path", "").strip())
+                self._status("Blender path saved." if ok else
+                             "Applied for this session, but saving to the plugin config failed.")
             elif kind == "set_auto_open":
-                _update_settings(auto_open=bool(data.get("value")))
-                self._status("Panel will open at startup." if data.get("value")
-                             else "Panel will not open at startup. Use 'Show Edit in Blender Panel'.")
+                ok = _update_settings(auto_open=bool(data.get("value")))
+                if not ok:
+                    self._status("Applied for this session, but saving to the plugin config failed.")
+                else:
+                    self._status("Panel will open at startup." if data.get("value")
+                                 else "Panel will not open at startup. Use 'Show Edit in Blender Panel'.")
         except Exception as e:  # keep the panel alive; show the error inline
             self._status(f"Error: {e}")
 
