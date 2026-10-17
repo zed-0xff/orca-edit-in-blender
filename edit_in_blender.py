@@ -11,7 +11,9 @@
 import json
 import os
 import platform
+import shutil
 import subprocess
+import tempfile
 import uuid
 from pathlib import Path
 
@@ -187,7 +189,7 @@ PANEL_HTML = """
     if (m.type === "state") {
       document.body.classList.toggle("compact", m.compact_mode);
       outDir = m.out_dir;
-      $("outdir").textContent = m.out_dir;
+      $("outdir").textContent = m.out_dir || "(nothing exported yet)";
       $("blender").value = m.blender;
       $("auto").checked = m.auto_open;
       $("load").disabled = !m.has_edits;
@@ -238,9 +240,26 @@ PLATE_EVENTS = {
 }
 
 
+_session_dir = None  # random per-launch folder under the plugin storage
+
+
 def _dirs():
-    root = _storage
+    root = _session_dir
     return root / "in", root / "out", root / "session.blend", root / "blender_startup.py"
+
+
+def _out_dir():
+    return _session_dir / "out" if _session_dir else None
+
+
+def _new_session_dir():
+    """Create a random session folder; prune older ones, keeping the previous for recovery."""
+    _storage.mkdir(parents=True, exist_ok=True)
+    older = sorted((d for d in _storage.glob("session_*") if d.is_dir()), key=lambda d: d.stat().st_mtime)
+    new = Path(tempfile.mkdtemp(prefix="session_", dir=_storage))
+    for d in older[:-1]:
+        shutil.rmtree(d, ignore_errors=True)
+    return new
 
 
 _blender_proc = None
@@ -334,6 +353,10 @@ def _export_and_launch(indices=None):
 
     Returns an ExecutionResult.
     """
+    global _blender_proc, _reload_seq, _exported, _session_dir
+    reuse = _blender_proc is not None and _blender_proc.poll() is None and _session_dir is not None
+    if not reuse:
+        _session_dir = _new_session_dir()
     in_dir, out_dir, session, startup = _dirs()
     in_dir.mkdir(parents=True, exist_ok=True)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -365,8 +388,7 @@ def _export_and_launch(indices=None):
     if not exported:
         return orca.ExecutionResult.skipped("No objects to export.")
 
-    global _blender_proc, _reload_seq, _exported
-    if _blender_proc is not None and _blender_proc.poll() is None:
+    if reuse:
         # Reuse the Blender this plugin started earlier; it polls reload.json.
         _exported = True
         _reload_seq += 1
@@ -398,8 +420,8 @@ def _export_and_launch(indices=None):
 
 
 def _load_edits():
-    out_dir = _dirs()[1]
-    files = sorted(out_dir.glob("*.stl"))
+    out_dir = _out_dir()
+    files = sorted(out_dir.glob("*.stl")) if out_dir else []
     if not files:
         return orca.ExecutionResult.skipped("No edited meshes found. Save the session in Blender first.")
     for f in files:
@@ -483,7 +505,7 @@ class EditInBlenderPanel(orca.script.ScriptPluginCapabilityBase):
                 self._panel.post({
                     "type": "state",
                     "objects": _list_objects(),
-                    "out_dir": str(_dirs()[1]),
+                    "out_dir": str(_out_dir() or ""),
                     "blender": _blender_path(),
                     "auto_open": _auto_open(),
                     "has_edits": _exported,
@@ -499,7 +521,9 @@ class EditInBlenderPanel(orca.script.ScriptPluginCapabilityBase):
             elif kind == "load":
                 self._status(_load_edits().message)
             elif kind == "reveal":
-                out_dir = _dirs()[1]
+                out_dir = _out_dir()
+                if out_dir is None:
+                    return self._status("Nothing exported yet.")
                 out_dir.mkdir(parents=True, exist_ok=True)
                 _open_path(out_dir)
             elif kind == "set_blender":
