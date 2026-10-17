@@ -12,6 +12,7 @@ import json
 import os
 import platform
 import subprocess
+import uuid
 from pathlib import Path
 
 import numpy as np
@@ -21,12 +22,15 @@ import orca
 # session .blend so Ctrl+S works, and re-exports every mesh object to OUT_DIR
 # on each save.
 BLENDER_SCRIPT = '''
-import bpy, sys
+import bpy, sys, json
 from pathlib import Path
 
 argv = sys.argv[sys.argv.index("--") + 1:]
-IN_DIR, OUT_DIR, SESSION = Path(argv[0]), Path(argv[1]), argv[2]
+IN_DIR, OUT_DIR, SESSION, TOKEN = Path(argv[0]), Path(argv[1]), argv[2], argv[3]
+ROOT = Path(SESSION).parent
+TOKEN_FILE, COMMAND_FILE = ROOT / "session.token", ROOT / "reload.json"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
+state = {"skip_export": False, "seq": 0}
 
 def import_stl(path):
     if hasattr(bpy.ops.wm, "stl_import"):
@@ -40,25 +44,63 @@ def export_stl(path):
     else:
         bpy.ops.export_mesh.stl(filepath=str(path), use_selection=True)
 
-def export_all(*_):
-    for obj in bpy.data.objects:
-        if obj.type != "MESH":
-            continue
-        bpy.ops.object.select_all(action="DESELECT")
-        obj.select_set(True)
-        bpy.context.view_layer.objects.active = obj
-        export_stl(OUT_DIR / (obj.name + ".stl"))
-    print("Edit in Blender: exported to", OUT_DIR)
+def export_all():
+    try:
+        meshes = [o for o in bpy.data.objects if o.type == "MESH"]
+        for obj in meshes:
+            for o in meshes:
+                o.select_set(o is obj)
+            bpy.context.view_layer.objects.active = obj
+            export_stl(OUT_DIR / (obj.name + ".stl"))
+        print("Edit in Blender: exported to", OUT_DIR)
+    except Exception:
+        import traceback
+        (OUT_DIR.parent / "blender_export.log").write_text(traceback.format_exc())
+        raise
+    return None
 
-def setup():
-    # Runs from a timer: during --python startup the UI context isn't ready,
-    # so import operators fail their poll().
+def on_save(*_):
+    if state["skip_export"]:
+        return  # our own save after (re)importing: nothing was edited yet
+    # Defer: running operators inside the save handler uses the save operator's
+    # context, where the STL exporter can fail. A timer runs in a normal context.
+    bpy.app.timers.register(export_all, first_interval=0.1)
+
+def import_all():
     for obj in list(bpy.data.objects):
         bpy.data.objects.remove(obj, do_unlink=True)
     for stl in sorted(IN_DIR.glob("*.stl")):
         import_stl(stl)
-    bpy.ops.wm.save_as_mainfile(filepath=SESSION)
-    bpy.app.handlers.save_post.append(export_all)
+    state["skip_export"] = True
+    try:
+        bpy.ops.wm.save_as_mainfile(filepath=SESSION)
+    finally:
+        state["skip_export"] = False
+
+def poll():
+    # The plugin asks this instance to load a new export by bumping "seq" in
+    # reload.json. If another instance has taken over the session token, stop.
+    try:
+        if TOKEN_FILE.read_text().strip() != TOKEN:
+            return None
+        if COMMAND_FILE.exists():
+            seq = json.loads(COMMAND_FILE.read_text())["seq"]
+            if seq != state["seq"]:
+                state["seq"] = seq
+                if bpy.data.is_dirty:  # keep unsaved edits recoverable
+                    bpy.ops.wm.save_as_mainfile(filepath=str(ROOT / "session.unsaved.blend"), copy=True)
+                import_all()
+    except Exception:
+        import traceback
+        (ROOT / "blender_export.log").write_text(traceback.format_exc())
+    return 1.0
+
+def setup():
+    # Runs from a timer: during --python startup the UI context isn't ready,
+    # so import operators fail their poll().
+    import_all()
+    bpy.app.handlers.save_post.append(on_save)
+    bpy.app.timers.register(poll, first_interval=1.0)
     return None
 
 bpy.app.timers.register(setup, first_interval=1.0)
@@ -79,6 +121,10 @@ PANEL_HTML = """
   button:disabled { opacity: 0.4; cursor: default; }
   button.secondary { background: transparent; color: var(--orca-fg); border: 1px solid var(--orca-border); }
   h4 { margin: 12px 0 4px; }
+  button.icon { background: transparent; color: var(--orca-muted); padding: 0 4px; margin: 0;
+                vertical-align: middle; }
+  button.icon:hover { color: var(--orca-fg); }
+  button.icon svg { display: block; }
   label { display: block; padding: 2px 0; }
   .muted { color: var(--orca-muted); font-size: 12px; word-break: break-all; }
   input[type=text] { width: 100%; box-sizing: border-box; background: transparent; color: var(--orca-fg);
@@ -86,9 +132,16 @@ PANEL_HTML = """
   #status { margin-top: 10px; min-height: 2em; }
   body.compact .full-only { display: none; }
 </style>
-<h4>Objects on plate</h4>
+<h4>
+  <button class="icon" id="refresh" title="Refresh" aria-label="Refresh">
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+         stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 3v6h-6"/>
+    </svg>
+  </button>
+  Objects
+</h4>
 <div id="objects" class="muted">Loading...</div>
-<button class="secondary" id="refresh">Refresh</button>
 <button class="secondary" id="all">Select all</button>
 <div id="actions">
   <h4 class="full-only">Send</h4>
@@ -109,7 +162,7 @@ PANEL_HTML = """
 <script>
   const $ = id => document.getElementById(id);
   const send = (type, extra) => orca.postMessage(Object.assign({type}, extra || {}));
-  let outDir = "";
+  let outDir = "", refreshTimer = null;
   const updateExport = () => {
     $("export").disabled = !document.querySelector("#objects input:checked");
   };
@@ -139,16 +192,24 @@ PANEL_HTML = """
       $("auto").checked = m.auto_open;
       $("load").disabled = !m.has_edits;
       const box = $("objects");
+      const wasEmpty = !box.querySelector("input");
+      const prev = new Map([...box.querySelectorAll("input")].map(c => [c.dataset.key, c.checked]));
       box.textContent = "";
       if (!m.objects.length) box.textContent = "The plate is empty.";
       m.objects.forEach(o => {
         const l = document.createElement("label");
         const c = document.createElement("input");
-        c.type = "checkbox"; c.value = o.index; c.checked = true;
+        c.type = "checkbox"; c.value = o.index;
+        c.dataset.key = o.index + ":" + o.name;
+        // New objects start checked only when the list was empty before.
+        c.checked = wasEmpty || prev.get(c.dataset.key) === true;
         l.append(c, " " + o.name + " (" + o.triangles + " tris)");
         box.append(l);
       });
       updateExport();
+    } else if (m.type === "changed") {
+      clearTimeout(refreshTimer);
+      refreshTimer = setTimeout(() => send("refresh"), 250);
     } else if (m.type === "edits") {
       $("load").disabled = !m.has;
     } else if (m.type === "status") {
@@ -157,7 +218,6 @@ PANEL_HTML = """
   });
   updateExport();
   send("refresh");
-  setInterval(() => send("poll_edits"), 2000);
 </script>
 """
 
@@ -171,18 +231,28 @@ def _init_storage():
     _storage = Path(orca.host.plugin.storage()) / "edit_in_blender"
 
 
+PLATE_EVENTS = {
+    "NewProject", "ProjectOpened", "ProjectClosed",
+    "ObjectAdded", "ObjectDeleted", "ObjectRenamed", "ObjectChanged",
+    "PlateSelected", "PlateDeleted",
+}
+
+
 def _dirs():
     root = _storage
-    return root / "in", root / "out", root / "session.blend", root / "blender_startup.py", root / "settings.json"
+    return root / "in", root / "out", root / "session.blend", root / "blender_startup.py"
 
 
+_blender_proc = None
+_exported = False  # set by the first successful export in this session
+_reload_seq = 0
 _settings = {}
 _config_owner = None
 
 
 def _default_settings():
     return {"blender_path": DEFAULT_BLENDER.get(platform.system(), "blender"),
-            "auto_open": True, "compact_mode": False}
+            "auto_open": True, "compact_mode": True}
 
 
 def _load_settings(owner):
@@ -200,14 +270,6 @@ def _load_settings(owner):
             owner.save_config(json.dumps(_settings))
         except Exception:
             pass
-    legacy = _dirs()[4]  # settings.json from before the native config
-    if legacy.exists():
-        try:
-            _settings.update(json.loads(legacy.read_text()))
-            if owner.save_config(json.dumps(_settings)):
-                legacy.unlink()
-        except (OSError, ValueError):
-            pass
 
 
 def _update_settings(**changes):
@@ -221,10 +283,6 @@ def _update_settings(**changes):
 
 def _blender_path():
     return _settings.get("blender_path") or _default_settings()["blender_path"]
-
-
-def _has_edits():
-    return any(_dirs()[1].glob("*.stl"))
 
 
 def _auto_open():
@@ -276,7 +334,7 @@ def _export_and_launch(indices=None):
 
     Returns an ExecutionResult.
     """
-    in_dir, out_dir, session, startup, _ = _dirs()
+    in_dir, out_dir, session, startup = _dirs()
     in_dir.mkdir(parents=True, exist_ok=True)
     out_dir.mkdir(parents=True, exist_ok=True)
     for old in (*in_dir.glob("*.stl"), *out_dir.glob("*.stl")):
@@ -307,17 +365,33 @@ def _export_and_launch(indices=None):
     if not exported:
         return orca.ExecutionResult.skipped("No objects to export.")
 
+    global _blender_proc, _reload_seq, _exported
+    if _blender_proc is not None and _blender_proc.poll() is None:
+        # Reuse the Blender this plugin started earlier; it polls reload.json.
+        _exported = True
+        _reload_seq += 1
+        (session.parent / "reload.json").write_text(json.dumps({"seq": _reload_seq}))
+        return orca.ExecutionResult.success(
+            f"Sent {exported} object(s) to the running Blender (it picks them up within a second). "
+            "Unsaved changes there are kept in session.unsaved.blend."
+        )
+
     startup.write_text(BLENDER_SCRIPT, encoding="utf-8")
+    token = uuid.uuid4().hex  # a newer launch supersedes any older plugin-started instance
+    (session.parent / "session.token").write_text(token)
+    (session.parent / "reload.json").unlink(missing_ok=True)
+    _reload_seq = 0
     blender = _blender_path()
     try:
-        subprocess.Popen(
-            [blender, "--python", str(startup), "--", str(in_dir), str(out_dir), str(session)]
+        _blender_proc = subprocess.Popen(
+            [blender, "--python", str(startup), "--", str(in_dir), str(out_dir), str(session), token]
         )
     except OSError as e:
         return orca.ExecutionResult.failure(
             orca.PluginResult.RecoverableError,
             f"Could not launch Blender at '{blender}': {e}. Set the path in the Edit in Blender panel.",
         )
+    _exported = True
     return orca.ExecutionResult.success(
         f"Exported {exported} object(s) to Blender. Save (Ctrl+S) in Blender, then load the edits."
     )
@@ -373,12 +447,22 @@ class EditInBlenderPanel(orca.script.ScriptPluginCapabilityBase):
         self._panel = orca.host.ui.create_dock_panel(
             html=PANEL_HTML,
             title="Edit in Blender",
-            width=220 if _settings.get("compact_mode") else 320,
+            width=150 if _settings.get("compact_mode") else 320,
             height=300 if _settings.get("compact_mode") else 520,
             on_message=self.on_message,
             on_close=self.on_close,
             dock="right",
         )
+
+    def on_lifecycle_event(self, event, ctx):
+        # Only tell the page the plate changed; it re-requests the list shortly
+        # after (the event can fire before the model is fully updated).
+        name = str(getattr(event, "name", event)).split(".")[-1]
+        if self._panel is not None and name in PLATE_EVENTS:
+            try:
+                self._panel.post({"type": "changed"})
+            except Exception:
+                pass
 
     def on_close(self, *_):
         self._panel = None
@@ -402,17 +486,15 @@ class EditInBlenderPanel(orca.script.ScriptPluginCapabilityBase):
                     "out_dir": str(_dirs()[1]),
                     "blender": _blender_path(),
                     "auto_open": _auto_open(),
-                    "has_edits": _has_edits(),
+                    "has_edits": _exported,
                     "compact_mode": bool(_settings.get("compact_mode")),
                 })
-            elif kind == "poll_edits":
-                self._panel.post({"type": "edits", "has": _has_edits()})
             elif kind == "export":
                 indices = set(data.get("indices") or [])
                 if not indices:
                     return self._status("Select at least one object.")
                 result = _export_and_launch(indices)
-                self._panel.post({"type": "edits", "has": _has_edits()})
+                self._panel.post({"type": "edits", "has": _exported})
                 self._status(result.message)
             elif kind == "load":
                 self._status(_load_edits().message)
