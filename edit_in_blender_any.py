@@ -6,7 +6,7 @@
 # name = "Edit in Blender"
 # description = "Export plate objects to Blender, edit them, and load the result back into OrcaSlicer."
 # author = 'Andrey "Zed" Zaikin'
-# version = "0.1.0"
+# version = "0.1.1"
 # ///
 import json
 import os
@@ -432,7 +432,8 @@ def _export_and_launch(indices=None):
 
 def _load_edits():
     out_dir = _out_dir()
-    files = sorted(out_dir.glob("*.stl")) if out_dir else []
+    # A binary STL is an 80-byte header plus a 4-byte count, so 84 bytes or less holds no triangles.
+    files = [f for f in sorted(out_dir.glob("*.stl")) if f.stat().st_size > 84] if out_dir else []
     if not files:
         return orca.ExecutionResult.skipped("No edited meshes found. Save the session in Blender first.")
     for f in files:
