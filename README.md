@@ -1,4 +1,4 @@
-# orca-edit-in-blender
+# Edit in Blender
 
 An [OrcaSlicer](https://github.com/OrcaSlicer/OrcaSlicer) 2.5.0+ plugin that sends objects from the plate to
 [Blender](https://www.blender.org/), and brings the edited meshes back.
